@@ -27,7 +27,8 @@ const logger = winston.createLogger({
 class VolumeBot {
   constructor() {
     this.config = {
-      amount: parseFloat(process.env.AMOUNT),
+      minAmount: parseFloat(process.env.MIN_AMOUNT || process.env.AMOUNT || 0.001),
+      maxAmount: parseFloat(process.env.MAX_AMOUNT || process.env.AMOUNT || 0.001),
       tokenAddress: process.env.TOKEN_ADDRESS,
       delay: parseInt(process.env.DELAY),
       sellDelay: parseInt(process.env.SELL_DELAY),
@@ -40,6 +41,24 @@ class VolumeBot {
     this.keys = keys;
     this.SOL_ADDRESS = "So11111111111111111111111111111111111111112";
     this.activeWallets = new Set();
+    
+    // Log the random amount range
+    if (this.config.minAmount !== this.config.maxAmount) {
+      logger.info(`💫 Random amounts enabled: ${this.config.minAmount} - ${this.config.maxAmount} SOL`);
+    } else {
+      logger.info(`Fixed amount: ${this.config.minAmount} SOL`);
+    }
+  }
+
+  // Generate random amount between min and max
+  getRandomAmount() {
+    const { minAmount, maxAmount } = this.config;
+    if (minAmount === maxAmount) {
+      return minAmount;
+    }
+    // Generate random amount with 4 decimal precision
+    const randomAmount = minAmount + (Math.random() * (maxAmount - minAmount));
+    return parseFloat(randomAmount.toFixed(4));
   }
 
   getAvailableKeypair() {
@@ -57,9 +76,11 @@ class VolumeBot {
     this.activeWallets.delete(publicKey);
   }
 
-  async performSwap(solanaTracker, keypair, isBuy) {
-    logger.info(`${isBuy ? chalk.white('[BUYING]') : chalk.white('[SELLING]')} [${keypair.publicKey.toBase58()}] Initiating swap`);
-    const { amount, tokenAddress, slippage, priorityFee } = this.config;
+  async performSwap(solanaTracker, keypair, isBuy, customAmount = null) {
+    const amount = customAmount || this.getRandomAmount();
+    logger.info(`${isBuy ? chalk.white('[BUYING]') : chalk.white('[SELLING]')} [${keypair.publicKey.toBase58()}] Initiating swap${isBuy ? ` with ${amount} SOL` : ''}`);
+    
+    const { tokenAddress, slippage, priorityFee } = this.config;
     const [fromToken, toToken] = isBuy
       ? [this.SOL_ADDRESS, tokenAddress]
       : [tokenAddress, this.SOL_ADDRESS];
@@ -76,7 +97,7 @@ class VolumeBot {
 
       const swapOptions = this.buildSwapOptions();
       const txid = await solanaTracker.performSwap(swapResponse, swapOptions);
-      this.logTransaction(txid, isBuy);
+      this.logTransaction(txid, isBuy, amount);
       return txid;
     } catch (error) {
       logger.error(`Error performing ${isBuy ? "buy" : "sell"}: ${error.message}`, { error });
@@ -107,8 +128,9 @@ class VolumeBot {
     return false;
   }
 
-  logTransaction(txid, isBuy) {
-    logger.info(`${isBuy ? chalk.green('[BOUGHT]') : chalk.red('[SOLD]')} [${txid}]`);
+  logTransaction(txid, isBuy, amount) {
+    const amountStr = isBuy && amount ? ` (${amount} SOL)` : '';
+    logger.info(`${isBuy ? chalk.green('[BOUGHT]') : chalk.red('[SOLD]')} [${txid}]${amountStr}`);
   }
 
   async run() {
