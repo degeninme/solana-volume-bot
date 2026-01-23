@@ -1,3 +1,27 @@
+# Environment variables (NEVER commit these!)
 .env
+.env.local
+.env.production
+
+# Dependencies
 node_modules
+package-lock.json
+
+# Logs
 volume-bot.log
+*.log
+npm-debug.log*
+logs/
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# Editor directories
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Railway
+.railway/
