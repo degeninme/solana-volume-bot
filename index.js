@@ -36,11 +36,15 @@ class VolumeBot {
       priorityFee: parseFloat(process.env.PRIORITY_FEE),
       useJito: process.env.JITO === "true",
       rpcUrl: process.env.RPC_URL,
-      threads: parseInt(process.env.THREADS) || 1
+      threads: parseInt(process.env.THREADS) || 1,
+      maxRetries: parseInt(process.env.MAX_RETRIES) || 3,
+      retryDelay: parseInt(process.env.RETRY_DELAY) || 10000 // 10 seconds between retries
     };
     this.keys = keys;
     this.SOL_ADDRESS = "So11111111111111111111111111111111111111112";
     this.activeWallets = new Set();
+    this.failedAttempts = 0;
+    this.successfulTrades = 0;
     
     // Log the random amount range
     if (this.config.minAmount !== this.config.maxAmount) {
@@ -56,7 +60,6 @@ class VolumeBot {
     if (minAmount === maxAmount) {
       return minAmount;
     }
-    // Generate random amount with 4 decimal precision
     const randomAmount = minAmount + (Math.random() * (maxAmount - minAmount));
     return parseFloat(randomAmount.toFixed(4));
   }
@@ -76,9 +79,10 @@ class VolumeBot {
     this.activeWallets.delete(publicKey);
   }
 
-  async performSwap(solanaTracker, keypair, isBuy, customAmount = null) {
+  async performSwap(solanaTracker, keypair, isBuy, customAmount = null, retryCount = 0) {
     const amount = customAmount || this.getRandomAmount();
-    logger.info(`${isBuy ? chalk.white('[BUYING]') : chalk.white('[SELLING]')} [${keypair.publicKey.toBase58()}] Initiating swap${isBuy ? ` with ${amount} SOL` : ''}`);
+    const walletShort = keypair.publicKey.toBase58().substring(0, 8);
+    logger.info(`${isBuy ? chalk.white('[BUYING]') : chalk.white('[SELLING]')} [${walletShort}...] ${isBuy ? `${amount} SOL` : 'all tokens'}${retryCount > 0 ? ` (Retry ${retryCount}/${this.config.maxRetries})` : ''}`);
     
     const { tokenAddress, slippage, priorityFee } = this.config;
     const [fromToken, toToken] = isBuy
@@ -97,10 +101,50 @@ class VolumeBot {
 
       const swapOptions = this.buildSwapOptions();
       const txid = await solanaTracker.performSwap(swapResponse, swapOptions);
+      
       this.logTransaction(txid, isBuy, amount);
+      this.successfulTrades++;
+      this.failedAttempts = 0; // Reset failed attempts on success
       return txid;
+      
     } catch (error) {
-      logger.error(`Error performing ${isBuy ? "buy" : "sell"}: ${error.message}`, { error });
+      const errorMsg = error.message || String(error);
+      
+      // Check if it's a rate limit error
+      if (errorMsg.includes('429') || errorMsg.includes('Rate limit')) {
+        logger.warn(`⚠️ Rate limited! Waiting ${this.config.retryDelay / 1000}s before retry...`);
+        await sleep(this.config.retryDelay);
+        
+        // Retry if we haven't exceeded max retries
+        if (retryCount < this.config.maxRetries) {
+          return await this.performSwap(solanaTracker, keypair, isBuy, amount, retryCount + 1);
+        } else {
+          logger.error(`❌ Max retries reached. Skipping this trade.`);
+          this.failedAttempts++;
+          return false;
+        }
+      }
+      
+      // Check if transaction expired
+      if (errorMsg.includes('expired')) {
+        logger.warn(`⚠️ Transaction expired. ${retryCount < this.config.maxRetries ? 'Retrying...' : 'Max retries reached.'}`);
+        
+        if (retryCount < this.config.maxRetries) {
+          await sleep(3000); // Wait 3 seconds before retry
+          return await this.performSwap(solanaTracker, keypair, isBuy, amount, retryCount + 1);
+        }
+      }
+      
+      logger.error(`❌ Error ${isBuy ? "buying" : "selling"}: ${errorMsg}`);
+      this.failedAttempts++;
+      
+      // If too many consecutive failures, increase delay
+      if (this.failedAttempts > 5) {
+        logger.warn(`🛑 Too many failures (${this.failedAttempts}). Adding extra delay...`);
+        await sleep(30000); // Wait 30 seconds
+        this.failedAttempts = 0;
+      }
+      
       return false;
     }
   }
@@ -119,41 +163,74 @@ class VolumeBot {
   }
 
   async swap(solanaTracker, keypair) {
+    logger.info(`🔄 Starting new trade cycle (Success: ${this.successfulTrades}, Failed: ${this.failedAttempts})`);
+    
     const buyTxid = await this.performSwap(solanaTracker, keypair, true);
+    
     if (buyTxid) {
+      logger.info(`✅ Buy successful! Waiting ${this.config.sellDelay / 1000}s before selling...`);
       await sleep(this.config.sellDelay);
+      
       const sellTxid = await this.performSwap(solanaTracker, keypair, false);
-      return sellTxid;
+      
+      if (sellTxid) {
+        logger.info(`✅ Sell successful! Trade cycle complete.`);
+        return true;
+      } else {
+        logger.warn(`⚠️ Sell failed. Tokens may be stuck in wallet!`);
+        return false;
+      }
+    } else {
+      logger.warn(`⚠️ Buy failed. Skipping sell.`);
+      return false;
     }
-    return false;
   }
 
   logTransaction(txid, isBuy, amount) {
     const amountStr = isBuy && amount ? ` (${amount} SOL)` : '';
-    logger.info(`${isBuy ? chalk.green('[BOUGHT]') : chalk.red('[SOLD]')} [${txid}]${amountStr}`);
+    const txUrl = `https://solscan.io/tx/${txid}`;
+    logger.info(`${isBuy ? chalk.green('✅ [BOUGHT]') : chalk.red('✅ [SOLD]')} ${txUrl}${amountStr}`);
   }
 
   async run() {
     while (true) {
-      const keypair = this.getAvailableKeypair();
-      const solanaTracker = new SolanaTracker(keypair, this.config.rpcUrl);
+      try {
+        const keypair = this.getAvailableKeypair();
+        const solanaTracker = new SolanaTracker(keypair, this.config.rpcUrl);
 
-      await this.swap(solanaTracker, keypair);
-      this.release(keypair.publicKey.toBase58());
-      await sleep(this.config.delay);
+        await this.swap(solanaTracker, keypair);
+        this.release(keypair.publicKey.toBase58());
+        
+        logger.info(`⏳ Waiting ${this.config.delay / 1000}s before next cycle...`);
+        await sleep(this.config.delay);
+        
+      } catch (error) {
+        logger.error(`❌ Critical error in run loop: ${error.message}`);
+        await sleep(30000); // Wait 30 seconds on critical error
+      }
     }
   }
 
   async start() {
-    logger.info('Starting Volume Bot');
+    logger.info('🚀 Starting Volume Bot');
+    logger.info(`📊 Configuration:`);
+    logger.info(`   - Token: ${this.config.tokenAddress}`);
+    logger.info(`   - Amount: ${this.config.minAmount}${this.config.minAmount !== this.config.maxAmount ? `-${this.config.maxAmount}` : ''} SOL`);
+    logger.info(`   - Delay: ${this.config.delay / 1000}s`);
+    logger.info(`   - Slippage: ${this.config.slippage}%`);
+    logger.info(`   - Threads: ${Math.min(this.config.threads, this.keys.length)}`);
+    logger.info(`   - RPC: ${this.config.rpcUrl.substring(0, 50)}...`);
+    
     const walletPromises = [];
     const availableThreads = Math.min(this.config.threads, this.keys.length);
+    
     for (let i = 0; i < availableThreads; i++) {
       walletPromises.push(this.run());
     }
+    
     await Promise.all(walletPromises);
   }
 }
 
 const bot = new VolumeBot();
-bot.start().catch(error => logger.error('Error in bot execution', { error }));
+bot.start().catch(error => logger.error('💥 Fatal error in bot execution', { error }));
