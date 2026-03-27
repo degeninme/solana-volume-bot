@@ -41,16 +41,17 @@ class VolumeBot {
       retryDelay: parseInt(process.env.RETRY_DELAY) || 10000 // 10 seconds between retries
     };
     this.keys = keys;
-    this.SOL_ADDRESS = "So11111111111111111111111111111111111111112";
+    // $Pigeon token address used as the base currency for all swaps
+    this.BASE_TOKEN_ADDRESS = "4fSWEw2wbYEUCcMtitzmeGUfqinoafXxkhqZrA9Gpump";
     this.activeWallets = new Set();
     this.failedAttempts = 0;
     this.successfulTrades = 0;
     
     // Log the random amount range
     if (this.config.minAmount !== this.config.maxAmount) {
-      logger.info(`💫 Random amounts enabled: ${this.config.minAmount} - ${this.config.maxAmount} SOL`);
+      logger.info(`💫 Random amounts enabled: ${this.config.minAmount} - ${this.config.maxAmount} $PIGEON`);
     } else {
-      logger.info(`Fixed amount: ${this.config.minAmount} SOL`);
+      logger.info(`Fixed amount: ${this.config.minAmount} $PIGEON`);
     }
   }
 
@@ -82,12 +83,14 @@ class VolumeBot {
   async performSwap(solanaTracker, keypair, isBuy, customAmount = null, retryCount = 0) {
     const amount = customAmount || this.getRandomAmount();
     const walletShort = keypair.publicKey.toBase58().substring(0, 8);
-    logger.info(`${isBuy ? chalk.white('[BUYING]') : chalk.white('[SELLING]')} [${walletShort}...] ${isBuy ? `${amount} SOL` : 'all tokens'}${retryCount > 0 ? ` (Retry ${retryCount}/${this.config.maxRetries})` : ''}`);
+    logger.info(`${isBuy ? chalk.white('[BUYING]') : chalk.white('[SELLING]')} [${walletShort}...] ${isBuy ? `${amount} $PIGEON` : 'all tokens'}${retryCount > 0 ? ` (Retry ${retryCount}/${this.config.maxRetries})` : ''}`);
     
     const { tokenAddress, slippage, priorityFee } = this.config;
+    // Buy: spend $PIGEON to get target token
+    // Sell: spend target token to get $PIGEON back
     const [fromToken, toToken] = isBuy
-      ? [this.SOL_ADDRESS, tokenAddress]
-      : [tokenAddress, this.SOL_ADDRESS];
+      ? [this.BASE_TOKEN_ADDRESS, tokenAddress]
+      : [tokenAddress, this.BASE_TOKEN_ADDRESS];
 
     try {
       const swapResponse = await solanaTracker.getSwapInstructions(
@@ -187,7 +190,7 @@ class VolumeBot {
   }
 
   logTransaction(txid, isBuy, amount) {
-    const amountStr = isBuy && amount ? ` (${amount} SOL)` : '';
+    const amountStr = isBuy && amount ? ` (${amount} $PIGEON)` : '';
     const txUrl = `https://solscan.io/tx/${txid}`;
     logger.info(`${isBuy ? chalk.green('✅ [BOUGHT]') : chalk.red('✅ [SOLD]')} ${txUrl}${amountStr}`);
   }
@@ -215,7 +218,8 @@ class VolumeBot {
     logger.info('🚀 Starting Volume Bot');
     logger.info(`📊 Configuration:`);
     logger.info(`   - Token: ${this.config.tokenAddress}`);
-    logger.info(`   - Amount: ${this.config.minAmount}${this.config.minAmount !== this.config.maxAmount ? `-${this.config.maxAmount}` : ''} SOL`);
+    logger.info(`   - Base Currency: $PIGEON (4fSWEw2wbYEUCcMtitzmeGUfqinoafXxkhqZrA9Gpump)`);
+    logger.info(`   - Amount: ${this.config.minAmount}${this.config.minAmount !== this.config.maxAmount ? `-${this.config.maxAmount}` : ''} $PIGEON`);
     logger.info(`   - Delay: ${this.config.delay / 1000}s`);
     logger.info(`   - Slippage: ${this.config.slippage}%`);
     logger.info(`   - Threads: ${Math.min(this.config.threads, this.keys.length)}`);
