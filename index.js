@@ -26,12 +26,13 @@ class VolumeBot {
       maxAmount: parseFloat(process.env.MAX_AMOUNT || process.env.AMOUNT || 0.001),
       tokenAddress: process.env.TOKEN_ADDRESS,
       delay: parseInt(process.env.DELAY) || 30000,
-      slippage: parseInt(process.env.SLIPPAGE) || 25,
+      slippage: parseInt(process.env.SLIPPAGE) || 30,
       priorityFee: parseFloat(process.env.PRIORITY_FEE) || 0.001,
       rpcUrl: process.env.RPC_URL,
       threads: parseInt(process.env.THREADS) || 1,
       maxRetries: parseInt(process.env.MAX_RETRIES) || 3,
-      retryDelay: parseInt(process.env.RETRY_DELAY) || 10000
+      retryDelay: parseInt(process.env.RETRY_DELAY) || 10000,
+      pool: process.env.POOL || 'pump-amm'
     };
     this.keys = keys;
     this.connection = new Connection(this.config.rpcUrl, 'confirmed');
@@ -66,44 +67,31 @@ class VolumeBot {
     this.activeWallets.delete(publicKey);
   }
 
-  // Send tx and keep resending every 2s until confirmed or block height exceeded
-  async sendAndConfirm(rawTx, lastValidBlockHeight) {
-    const serialized = rawTx.serialize();
-    let txid = null;
-
-    // Initial send
-    txid = await this.connection.sendRawTransaction(serialized, { skipPreflight: true });
+  // Poll for confirmation, resending every 2s to keep tx alive
+  async sendAndConfirm(serialized, lastValidBlockHeight) {
+    let txid = await this.connection.sendRawTransaction(serialized, { skipPreflight: true });
     logger.info(`📤 Sent tx: ${txid.substring(0, 20)}... polling...`);
 
-    const startTime = Date.now();
-    const timeout = 90000; // 90 seconds max
+    const deadline = Date.now() + 90000;
 
-    while (Date.now() - startTime < timeout) {
-      // Check confirmation
+    while (Date.now() < deadline) {
       const status = await this.connection.getSignatureStatus(txid, {
         searchTransactionHistory: false
       });
 
       const conf = status?.value?.confirmationStatus;
-      if (conf === 'confirmed' || conf === 'finalized') {
-        return txid;
-      }
+      if (conf === 'confirmed' || conf === 'finalized') return txid;
 
-      // Check if tx is permanently failed
       if (status?.value?.err) {
-        throw new Error(`Transaction failed on-chain: ${JSON.stringify(status.value.err)}`);
+        throw new Error(`On-chain error: ${JSON.stringify(status.value.err)}`);
       }
 
-      // Check if blockhash still valid
-      const currentBlock = await this.connection.getBlockHeight('confirmed');
-      if (currentBlock > lastValidBlockHeight) {
-        throw new Error('expired');
-      }
+      const blockHeight = await this.connection.getBlockHeight('confirmed');
+      if (blockHeight > lastValidBlockHeight) throw new Error('expired');
 
-      // Resend to keep it alive and wait
       try {
         await this.connection.sendRawTransaction(serialized, { skipPreflight: true });
-      } catch (_) { /* ignore resend errors */ }
+      } catch (_) {}
 
       await sleep(2000);
     }
@@ -117,7 +105,7 @@ class VolumeBot {
     logger.info(`${chalk.white('[BUYING]')} [${walletShort}...] ${amount} SOL${retryCount > 0 ? ` (Retry ${retryCount}/${this.config.maxRetries})` : ''}`);
 
     try {
-      // Step 1: Get transaction from PumpPortal
+      // Step 1: Get tx from PumpPortal trade-local
       const response = await fetch('https://pumpportal.fun/api/trade-local', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -129,7 +117,7 @@ class VolumeBot {
           amount: amount,
           slippage: this.config.slippage,
           priorityFee: this.config.priorityFee,
-          pool: process.env.POOL || 'pump-amm'
+          pool: this.config.pool
         })
       });
 
@@ -138,14 +126,19 @@ class VolumeBot {
         throw new Error(`PumpPortal API error ${response.status}: ${errText}`);
       }
 
-      // Step 2: Deserialize and sign
+      // Step 2: Deserialize
       const txBuffer = await response.arrayBuffer();
       const tx = VersionedTransaction.deserialize(new Uint8Array(txBuffer));
+
+      // Step 3: Get fresh blockhash THEN sign — keeps validity window maximum
+      const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash('finalized');
+      tx.message.recentBlockhash = blockhash;
       tx.sign([keypair]);
 
-      // Step 3: Get block height for expiry check, then send + poll
-      const { lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
-      const txid = await this.sendAndConfirm(tx, lastValidBlockHeight);
+      const serialized = tx.serialize();
+
+      // Step 4: Send + poll with resend loop
+      const txid = await this.sendAndConfirm(serialized, lastValidBlockHeight);
 
       logger.info(`${chalk.green('✅ [BOUGHT]')} https://solscan.io/tx/${txid} (${amount} SOL)`);
       this.successfulTrades++;
@@ -155,21 +148,16 @@ class VolumeBot {
     } catch (error) {
       const errorMsg = error.message || String(error);
 
-      // Rate limit retry
       if (errorMsg.includes('429') || errorMsg.includes('Rate limit')) {
         logger.warn(`⚠️ Rate limited! Waiting ${this.config.retryDelay / 1000}s...`);
         await sleep(this.config.retryDelay);
-        if (retryCount < this.config.maxRetries) {
-          return await this.performBuy(keypair, retryCount + 1);
-        }
-        logger.error(`❌ Max retries reached. Skipping.`);
+        if (retryCount < this.config.maxRetries) return await this.performBuy(keypair, retryCount + 1);
         this.failedAttempts++;
         return false;
       }
 
-      // Expired — fetch a fresh tx and retry
       if (errorMsg === 'expired' || errorMsg.includes('BlockhashNotFound')) {
-        logger.warn(`⚠️ Transaction expired. ${retryCount < this.config.maxRetries ? 'Retrying with fresh tx...' : 'Max retries reached.'}`);
+        logger.warn(`⚠️ Transaction expired. ${retryCount < this.config.maxRetries ? 'Retrying...' : 'Max retries reached.'}`);
         if (retryCount < this.config.maxRetries) {
           await sleep(1000);
           return await this.performBuy(keypair, retryCount + 1);
@@ -180,7 +168,7 @@ class VolumeBot {
       this.failedAttempts++;
 
       if (this.failedAttempts > 5) {
-        logger.warn(`🛑 Too many failures (${this.failedAttempts}). Cooling down 30s...`);
+        logger.warn(`🛑 Too many failures. Cooling down 30s...`);
         await sleep(30000);
         this.failedAttempts = 0;
       }
@@ -193,17 +181,13 @@ class VolumeBot {
     while (true) {
       try {
         const keypair = this.getAvailableKeypair();
-
-        logger.info(`🔄 Starting buy (Total buys: ${this.successfulTrades}, Failed: ${this.failedAttempts})`);
+        logger.info(`🔄 Starting buy (Total: ${this.successfulTrades}, Failed: ${this.failedAttempts})`);
         await this.performBuy(keypair);
-
         this.release(keypair.publicKey.toBase58());
-
         logger.info(`⏳ Waiting ${this.config.delay / 1000}s before next buy...`);
         await sleep(this.config.delay);
-
       } catch (error) {
-        logger.error(`❌ Critical error in run loop: ${error.message}`);
+        logger.error(`❌ Critical error: ${error.message}`);
         await sleep(30000);
       }
     }
@@ -212,20 +196,17 @@ class VolumeBot {
   async start() {
     logger.info('🚀 Starting Volume Bot (PumpPortal Buy-Only Mode)');
     logger.info(`📊 Configuration:`);
-    logger.info(`   - Token: ${this.config.tokenAddress}`);
-    logger.info(`   - Amount: ${this.config.minAmount}${this.config.minAmount !== this.config.maxAmount ? `-${this.config.maxAmount}` : ''} SOL`);
-    logger.info(`   - Delay: ${this.config.delay / 1000}s`);
-    logger.info(`   - Slippage: ${this.config.slippage}%`);
+    logger.info(`   - Token:        ${this.config.tokenAddress}`);
+    logger.info(`   - Pool:         ${this.config.pool}`);
+    logger.info(`   - Amount:       ${this.config.minAmount}${this.config.minAmount !== this.config.maxAmount ? `-${this.config.maxAmount}` : ''} SOL`);
+    logger.info(`   - Delay:        ${this.config.delay / 1000}s`);
+    logger.info(`   - Slippage:     ${this.config.slippage}%`);
     logger.info(`   - Priority Fee: ${this.config.priorityFee} SOL`);
-    logger.info(`   - Pool: ${process.env.POOL || 'pump-amm'}`);
-    logger.info(`   - Threads: ${Math.min(this.config.threads, this.keys.length)}`);
-    logger.info(`   - RPC: ${this.config.rpcUrl.substring(0, 50)}...`);
+    logger.info(`   - Threads:      ${Math.min(this.config.threads, this.keys.length)}`);
+    logger.info(`   - RPC:          ${this.config.rpcUrl.substring(0, 50)}...`);
 
-    const walletPromises = [];
     const availableThreads = Math.min(this.config.threads, this.keys.length);
-    for (let i = 0; i < availableThreads; i++) {
-      walletPromises.push(this.run());
-    }
+    const walletPromises = Array.from({ length: availableThreads }, () => this.run());
     await Promise.all(walletPromises);
   }
 }
