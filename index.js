@@ -84,7 +84,7 @@ class VolumeBot {
           amount: amount,
           slippage: this.config.slippage,
           priorityFee: this.config.priorityFee,
-          pool: 'pump'
+          pool: process.env.POOL || 'pump-amm'
         })
       });
 
@@ -181,6 +181,7 @@ class VolumeBot {
     logger.info(`   - Delay: ${this.config.delay / 1000}s`);
     logger.info(`   - Slippage: ${this.config.slippage}%`);
     logger.info(`   - Priority Fee: ${this.config.priorityFee} SOL`);
+    logger.info(`   - Pool: ${process.env.POOL || 'pump-amm'}`);
     logger.info(`   - Threads: ${Math.min(this.config.threads, this.keys.length)}`);
     logger.info(`   - RPC: ${this.config.rpcUrl.substring(0, 50)}...`);
 
