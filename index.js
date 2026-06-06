@@ -66,13 +66,58 @@ class VolumeBot {
     this.activeWallets.delete(publicKey);
   }
 
+  // Send tx and keep resending every 2s until confirmed or block height exceeded
+  async sendAndConfirm(rawTx, lastValidBlockHeight) {
+    const serialized = rawTx.serialize();
+    let txid = null;
+
+    // Initial send
+    txid = await this.connection.sendRawTransaction(serialized, { skipPreflight: true });
+    logger.info(`📤 Sent tx: ${txid.substring(0, 20)}... polling...`);
+
+    const startTime = Date.now();
+    const timeout = 90000; // 90 seconds max
+
+    while (Date.now() - startTime < timeout) {
+      // Check confirmation
+      const status = await this.connection.getSignatureStatus(txid, {
+        searchTransactionHistory: false
+      });
+
+      const conf = status?.value?.confirmationStatus;
+      if (conf === 'confirmed' || conf === 'finalized') {
+        return txid;
+      }
+
+      // Check if tx is permanently failed
+      if (status?.value?.err) {
+        throw new Error(`Transaction failed on-chain: ${JSON.stringify(status.value.err)}`);
+      }
+
+      // Check if blockhash still valid
+      const currentBlock = await this.connection.getBlockHeight('confirmed');
+      if (currentBlock > lastValidBlockHeight) {
+        throw new Error('expired');
+      }
+
+      // Resend to keep it alive and wait
+      try {
+        await this.connection.sendRawTransaction(serialized, { skipPreflight: true });
+      } catch (_) { /* ignore resend errors */ }
+
+      await sleep(2000);
+    }
+
+    throw new Error('expired');
+  }
+
   async performBuy(keypair, retryCount = 0) {
     const amount = this.getRandomAmount();
     const walletShort = keypair.publicKey.toBase58().substring(0, 8);
     logger.info(`${chalk.white('[BUYING]')} [${walletShort}...] ${amount} SOL${retryCount > 0 ? ` (Retry ${retryCount}/${this.config.maxRetries})` : ''}`);
 
     try {
-      // Step 1: Get the transaction from PumpPortal
+      // Step 1: Get transaction from PumpPortal
       const response = await fetch('https://pumpportal.fun/api/trade-local', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -93,26 +138,14 @@ class VolumeBot {
         throw new Error(`PumpPortal API error ${response.status}: ${errText}`);
       }
 
-      // Step 2: Deserialize, stamp with fresh blockhash, sign, and send
+      // Step 2: Deserialize and sign
       const txBuffer = await response.arrayBuffer();
       const tx = VersionedTransaction.deserialize(new Uint8Array(txBuffer));
-
-      // Get fresh blockhash right before signing to maximise validity window
-      const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
-      tx.message.recentBlockhash = blockhash;
       tx.sign([keypair]);
 
-      const txid = await this.connection.sendTransaction(tx, {
-        skipPreflight: true,
-        maxRetries: 5,
-        preflightCommitment: 'processed'
-      });
-
-      // Step 3: Confirm within the same blockhash window
-      await this.connection.confirmTransaction(
-        { signature: txid, blockhash, lastValidBlockHeight },
-        'confirmed'
-      );
+      // Step 3: Get block height for expiry check, then send + poll
+      const { lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
+      const txid = await this.sendAndConfirm(tx, lastValidBlockHeight);
 
       logger.info(`${chalk.green('✅ [BOUGHT]')} https://solscan.io/tx/${txid} (${amount} SOL)`);
       this.successfulTrades++;
@@ -134,9 +167,9 @@ class VolumeBot {
         return false;
       }
 
-      // Blockhash expired retry
-      if (errorMsg.includes('expired') || errorMsg.includes('BlockhashNotFound')) {
-        logger.warn(`⚠️ Transaction expired. ${retryCount < this.config.maxRetries ? 'Retrying...' : 'Max retries reached.'}`);
+      // Expired — fetch a fresh tx and retry
+      if (errorMsg === 'expired' || errorMsg.includes('BlockhashNotFound')) {
+        logger.warn(`⚠️ Transaction expired. ${retryCount < this.config.maxRetries ? 'Retrying with fresh tx...' : 'Max retries reached.'}`);
         if (retryCount < this.config.maxRetries) {
           await sleep(1000);
           return await this.performBuy(keypair, retryCount + 1);
