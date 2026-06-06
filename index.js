@@ -93,9 +93,13 @@ class VolumeBot {
         throw new Error(`PumpPortal API error ${response.status}: ${errText}`);
       }
 
-      // Step 2: Deserialize, sign, and send the transaction
+      // Step 2: Deserialize, stamp with fresh blockhash, sign, and send
       const txBuffer = await response.arrayBuffer();
       const tx = VersionedTransaction.deserialize(new Uint8Array(txBuffer));
+
+      // Get fresh blockhash right before signing to maximise validity window
+      const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
+      tx.message.recentBlockhash = blockhash;
       tx.sign([keypair]);
 
       const txid = await this.connection.sendTransaction(tx, {
@@ -104,8 +108,7 @@ class VolumeBot {
         preflightCommitment: 'processed'
       });
 
-      // Step 3: Confirm
-      const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
+      // Step 3: Confirm within the same blockhash window
       await this.connection.confirmTransaction(
         { signature: txid, blockhash, lastValidBlockHeight },
         'confirmed'
@@ -135,7 +138,7 @@ class VolumeBot {
       if (errorMsg.includes('expired') || errorMsg.includes('BlockhashNotFound')) {
         logger.warn(`⚠️ Transaction expired. ${retryCount < this.config.maxRetries ? 'Retrying...' : 'Max retries reached.'}`);
         if (retryCount < this.config.maxRetries) {
-          await sleep(3000);
+          await sleep(1000);
           return await this.performBuy(keypair, retryCount + 1);
         }
       }
