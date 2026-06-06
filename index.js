@@ -30,15 +30,13 @@ class VolumeBot {
       priorityFee: parseFloat(process.env.PRIORITY_FEE) || 0.001,
       rpcUrl: process.env.RPC_URL,
       threads: parseInt(process.env.THREADS) || 1,
-      maxRetries: parseInt(process.env.MAX_RETRIES) || 3,
-      retryDelay: parseInt(process.env.RETRY_DELAY) || 10000,
       pool: process.env.POOL || 'pump-amm'
     };
     this.keys = keys;
     this.connection = new Connection(this.config.rpcUrl, 'confirmed');
     this.activeWallets = new Set();
-    this.failedAttempts = 0;
     this.successfulTrades = 0;
+    this.failedAttempts = 0;
 
     if (this.config.minAmount !== this.config.maxAmount) {
       logger.info(`💫 Random amounts enabled: ${this.config.minAmount} - ${this.config.maxAmount} SOL`);
@@ -67,45 +65,13 @@ class VolumeBot {
     this.activeWallets.delete(publicKey);
   }
 
-  // Poll for confirmation, resending every 2s to keep tx alive
-  async sendAndConfirm(serialized, lastValidBlockHeight) {
-    let txid = await this.connection.sendRawTransaction(serialized, { skipPreflight: true });
-    logger.info(`📤 Sent tx: ${txid.substring(0, 20)}... polling...`);
-
-    const deadline = Date.now() + 90000;
-
-    while (Date.now() < deadline) {
-      const status = await this.connection.getSignatureStatus(txid, {
-        searchTransactionHistory: false
-      });
-
-      const conf = status?.value?.confirmationStatus;
-      if (conf === 'confirmed' || conf === 'finalized') return txid;
-
-      if (status?.value?.err) {
-        throw new Error(`On-chain error: ${JSON.stringify(status.value.err)}`);
-      }
-
-      const blockHeight = await this.connection.getBlockHeight('confirmed');
-      if (blockHeight > lastValidBlockHeight) throw new Error('expired');
-
-      try {
-        await this.connection.sendRawTransaction(serialized, { skipPreflight: true });
-      } catch (_) {}
-
-      await sleep(2000);
-    }
-
-    throw new Error('expired');
-  }
-
-  async performBuy(keypair, retryCount = 0) {
+  async performBuy(keypair) {
     const amount = this.getRandomAmount();
     const walletShort = keypair.publicKey.toBase58().substring(0, 8);
-    logger.info(`${chalk.white('[BUYING]')} [${walletShort}...] ${amount} SOL${retryCount > 0 ? ` (Retry ${retryCount}/${this.config.maxRetries})` : ''}`);
+    logger.info(`${chalk.white('[BUYING]')} [${walletShort}...] ${amount} SOL`);
 
     try {
-      // Step 1: Get tx from PumpPortal trade-local
+      // Step 1: Get transaction from PumpPortal
       const response = await fetch('https://pumpportal.fun/api/trade-local', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -126,42 +92,70 @@ class VolumeBot {
         throw new Error(`PumpPortal API error ${response.status}: ${errText}`);
       }
 
-      // Step 2: Deserialize
+      // Step 2: Deserialize and sign immediately (use tx as-is, blockhash is fresh from API)
       const txBuffer = await response.arrayBuffer();
       const tx = VersionedTransaction.deserialize(new Uint8Array(txBuffer));
-
-      // Step 3: Get fresh blockhash THEN sign — keeps validity window maximum
-      const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash('finalized');
-      tx.message.recentBlockhash = blockhash;
       tx.sign([keypair]);
-
       const serialized = tx.serialize();
 
-      // Step 4: Send + poll with resend loop
-      const txid = await this.sendAndConfirm(serialized, lastValidBlockHeight);
+      // Step 3: Send immediately, then resend every 1.5s for 40s (covering the full blockhash window)
+      const txid = await this.connection.sendRawTransaction(serialized, { skipPreflight: true });
+      logger.info(`📤 Sent: ${txid.substring(0, 20)}... confirming...`);
 
-      logger.info(`${chalk.green('✅ [BOUGHT]')} https://solscan.io/tx/${txid} (${amount} SOL)`);
-      this.successfulTrades++;
-      this.failedAttempts = 0;
-      return txid;
+      // Resend loop — keep hammering validators for 40s
+      const resendUntil = Date.now() + 40000;
+      let confirmed = false;
+
+      while (Date.now() < resendUntil) {
+        await sleep(1500);
+
+        // Check status
+        const status = await this.connection.getSignatureStatus(txid, {
+          searchTransactionHistory: true
+        });
+        const conf = status?.value?.confirmationStatus;
+
+        if (conf === 'confirmed' || conf === 'finalized') {
+          confirmed = true;
+          break;
+        }
+
+        if (status?.value?.err) {
+          throw new Error(`On-chain error: ${JSON.stringify(status.value.err)}`);
+        }
+
+        // Resend
+        try {
+          await this.connection.sendRawTransaction(serialized, { skipPreflight: true });
+        } catch (_) {}
+      }
+
+      if (!confirmed) {
+        // One last check with history search
+        const finalStatus = await this.connection.getSignatureStatus(txid, {
+          searchTransactionHistory: true
+        });
+        const conf = finalStatus?.value?.confirmationStatus;
+        if (conf === 'confirmed' || conf === 'finalized') {
+          confirmed = true;
+        }
+      }
+
+      if (confirmed) {
+        logger.info(`${chalk.green('✅ [BOUGHT]')} https://solscan.io/tx/${txid} (${amount} SOL)`);
+        this.successfulTrades++;
+        this.failedAttempts = 0;
+        return txid;
+      } else {
+        throw new Error('Transaction not confirmed within window');
+      }
 
     } catch (error) {
       const errorMsg = error.message || String(error);
 
       if (errorMsg.includes('429') || errorMsg.includes('Rate limit')) {
-        logger.warn(`⚠️ Rate limited! Waiting ${this.config.retryDelay / 1000}s...`);
-        await sleep(this.config.retryDelay);
-        if (retryCount < this.config.maxRetries) return await this.performBuy(keypair, retryCount + 1);
-        this.failedAttempts++;
-        return false;
-      }
-
-      if (errorMsg === 'expired' || errorMsg.includes('BlockhashNotFound')) {
-        logger.warn(`⚠️ Transaction expired. ${retryCount < this.config.maxRetries ? 'Retrying...' : 'Max retries reached.'}`);
-        if (retryCount < this.config.maxRetries) {
-          await sleep(1000);
-          return await this.performBuy(keypair, retryCount + 1);
-        }
+        logger.warn(`⚠️ Rate limited! Waiting 10s...`);
+        await sleep(10000);
       }
 
       logger.error(`❌ Error buying: ${errorMsg}`);
@@ -206,8 +200,7 @@ class VolumeBot {
     logger.info(`   - RPC:          ${this.config.rpcUrl.substring(0, 50)}...`);
 
     const availableThreads = Math.min(this.config.threads, this.keys.length);
-    const walletPromises = Array.from({ length: availableThreads }, () => this.run());
-    await Promise.all(walletPromises);
+    await Promise.all(Array.from({ length: availableThreads }, () => this.run()));
   }
 }
 
